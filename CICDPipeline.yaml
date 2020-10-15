@@ -1,0 +1,351 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+
+1 - GitHub manages and Stores your service source code.
+2 - S3 manages CodeBuild Artifacts
+3 - CodeBuild manages and buildspen=c has all configuration under buildspec.yaml
+4 - CodePipeline  manages and Runs the Continuous Integration and Continuous Deployment pipeline
+
+Parameters:
+  GitRepo:
+    Description: Git Repo name
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /bvutiiee/moodlekavak
+
+  Gittoken:
+    Description: Github OAuth Token
+    Type: AWS::SSM::Parameter::Value<String>
+    NoEcho: true
+    Default: bvutiiee/moodlekavak/github/token
+
+  Gituser:
+    Description: Github user
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /bvutiiee/moodlekavak/github/user
+
+  Lambdaintegrationtest:
+    Description: Name of the lambda function that will be used for running integration tests
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: bvutiiee/moodlekavaklambda/name
+
+Resources:
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: "Stack"
+          Value: !Ref AWS::StackName
+        - Key: "Project"
+          Value: moodle-pipeline
+    DeletionPolicy: Retain
+  Moodlecodebuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: moodle-pipeline
+      Description: Build project for the moodle-pipeline
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        EnvironmentVariables:
+          - Name: BUILD_Project
+            Value: !Ref ArtifactsBucket
+      Cache:
+        Type: S3
+        Location: !Sub ${ArtifactsBucket}/codebuild-cache
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: moodleapp/buildspec.yaml
+      Tags:
+        - Key: "Stack"
+          Value: !Ref AWS::StackName
+        - Key: "Project"
+          Value: moodle-pipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref ArtifactsBucket
+        Type: S3
+      Name: moodle-pipeline
+      RoleArn: !GetAtt CodePipelineExecRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceCodeRepo
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: "1"
+              Configuration:
+                Owner: !Ref Gituser
+                Repo: !Ref GitRepo
+                Branch: master
+                OAuthToken: !Ref Gittoken
+              OutputArtifacts:
+                - Name: SourceCodeAsZip
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref Moodlecodebuild
+              InputArtifacts:
+                - Name: SourceCodeAsZip
+              OutputArtifacts:
+                - Name: BuildArtifactAsZip
+        - Name: Stage
+          Actions:
+            - Name: PipelineDeploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                RoleArn: !GetAtt CFNExecutionRole.Arn
+                StackName: moodle-pipeline-Stage
+                ChangeSetName: moodle-pipeline-ChangeSet-Stage
+                TemplatePath: BuildArtifactAsZip::packaged.yml
+                Capabilities: CAPABILITY_IAM
+                ParameterOverrides: |
+                  {
+                    "MyEnvironment" : "staging"
+                  }
+              InputArtifacts:
+                - Name: BuildArtifactAsZip
+              RunOrder: 1
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                RoleArn: !GetAtt CFNExecutionRole.Arn
+                StackName: moodle-pipeline-Stage
+                ChangeSetName: moodle-pipeline-ChangeSet-Stage
+              OutputArtifacts:
+                - Name: moodle-pipelineStageChangeSet
+              RunOrder: 2
+            - Name: LamdbaRunTests
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref Lambdaintegrationtest
+              OutputArtifacts: []
+              InputArtifacts: []
+              Region: us-east-1
+              RunOrder: 3
+        - Name: production
+          Actions:
+            - Name: DeploymentApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: "1"
+              RunOrder: 1
+            - Name: PipelineDeploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                RoleArn: !GetAtt CFNExecutionRole.Arn
+                StackName: moodle-pipeline-production
+                ChangeSetName: moodle-pipeline-ChangeSet-production
+                TemplatePath: BuildArtifactAsZip::packaged.yml
+                Capabilities: CAPABILITY_IAM
+                ParameterOverrides: |
+                  {
+                    "MyEnvironment" : "production"
+                  }
+              InputArtifacts:
+                - Name: BuildArtifactAsZip
+              RunOrder: 2
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                RoleArn: !GetAtt CFNExecutionRole.Arn
+                StackName: moodle-pipeline-production
+                ChangeSetName: moodle-pipeline-ChangeSet-production
+              OutputArtifacts:
+                - Name: moodle-pipelineproductionChangeSet
+              RunOrder: 3
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/moodle-pipeline"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/moodle-pipeline:*"
+        - PolicyName: CodeArtifactsBucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${ArtifactsBucket}/*"
+        - PolicyName: CodeBuildParameterStore
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "ssm:GetParameters"
+                Resource: "*"
+
+  CFNExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Action: "sts:AssumeRole"
+          Effect: Allow
+          Principal:
+            Service: cloudformation.amazonaws.com
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+
+  CodePipelineExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                  - "lambda:InvokeFunction"
+                  - "lambda:ListFunctions"
+                  - "lambda:InvokeAsyc"
+                Resource: "*"
+        - PolicyName: CodePipelineCodeAndArtifactsS3Bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "s3:*"
+                Resource: !Sub "arn:aws:s3:::${ArtifactsBucket}/*"
+        - PolicyName: CodePipelineCodeBuildAndCloudformationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "codebuild:StartBuild"
+                  - "codebuild:BatchGetBuilds"
+                Resource:
+                  - !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${Moodlecodebuild}"
+              - Effect: Allow
+                Action:
+                  - "cloudformation:CreateStack"
+                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:DeleteStack"
+                  - "cloudformation:UpdateStack"
+                  - "cloudformation:PipelineDeploy"
+                  - "cloudformation:ExecuteChangeSet"
+                  - "cloudformation:DeleteChangeSet"
+                  - "cloudformation:DescribeChangeSet"
+                  - "cloudformation:SetStackPolicy"
+                  - "cloudformation:SetStackPolicy"
+                  - "cloudformation:ValidateTemplate"
+                Resource:
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/moodle-pipeline*/*"
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
+
+Outputs:
+  GitRepoUrl:
+    Description:  Git repository
+    Value: !Sub https://github.com/${Gituser}/${GitRepo}.git
+
+  GitRepoSsh:
+    Description:  Git repository
+    Value: !Sub git@github.com:${Gituser}/${GitRepo}.git
+
+  BuildArtifactS3:
+    Description: S3 Bucket for Pipeline and Build artifacts
+    Value: !Ref ArtifactsBucket
+
+  Moodlecodebuild:
+    Description: CodeBuild Project name
+    Value: !Ref Moodlecodebuild
+
+  CodePipeline:
+    Description: AWS CodePipeline pipeline name
+    Value: !Ref Pipeline
+
+  CodeBuildIAMRole:
+    Description: CodeBuild IAM Role
+    Value: !GetAtt CodeBuildRole.Arn
+
+  CloudformationIAMRole:
+    Description: Cloudformation IAM Role
+    Value: !GetAtt CFNExecutionRole.Arn
+
+  CodePipelineIAMRole:
+    Description: CodePipeline IAM Role
+    Value: !GetAtt CodePipelineExecRole.Arn
+© 20
